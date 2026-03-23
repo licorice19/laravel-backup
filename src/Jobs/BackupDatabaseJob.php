@@ -18,9 +18,9 @@ class BackupDatabaseJob implements ShouldQueue
     {
         try {
             $path = $backupService->backupDatabase();
-            Log::info('Бекап создан: ' . basename($path));
+            Log::info('Backup created: ' . basename($path));
         } catch (\Exception $e) {
-            Log::error('Ошибка создания бекапа: ' . $e->getMessage());
+            Log::error('Error creating backup: ' . $e->getMessage());
             throw $e;
         }
     }

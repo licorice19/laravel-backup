@@ -18,9 +18,9 @@ class CleanOldBackupsJob implements ShouldQueue
     {
         try {
             $count = $backupService->cleanOldBackups();
-            Log::info("Очистка завершена, удалено бекапов: {$count}");
+            Log::info("Cleaning completed, backups deleted: {$count}");
         } catch (\Exception $e) {
-            Log::error('Ошибка очистки бекапов: ' . $e->getMessage());
+            Log::error('Error clearing backups: ' . $e->getMessage());
             throw $e;
         }
     }

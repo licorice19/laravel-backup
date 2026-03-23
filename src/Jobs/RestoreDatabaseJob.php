@@ -25,9 +25,9 @@ class RestoreDatabaseJob implements ShouldQueue
     {
         try {
             $backupService->restore($this->filename);
-            Log::info("Восстановление завершено из: {$this->filename}");
+            Log::info("Restore completed from: {$this->filename}");
         } catch (\Exception $e) {
-            Log::error('Ошибка восстановления: ' . $e->getMessage());
+            Log::error('Restore Error: ' . $e->getMessage());
             throw $e;
         }
     }

@@ -1,12 +1,5 @@
 <?php
 
-use Licorice19\Backup\Services\BackupService;
+namespace Tests;
 
-beforeEach(function () {
-    // Setup before each test
-});
-
-it('can instantiate backup service', function () {
-    $service = app(BackupService::class);
-    expect($service)->toBeInstanceOf(BackupService::class);
-});
+uses(TestCase::class)->in(__DIR__);

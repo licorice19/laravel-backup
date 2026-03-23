@@ -8,14 +8,14 @@ use Illuminate\Console\Command;
 class BackupRun extends Command
 {
     protected $signature = 'backup:run
-        {--only-db : Создать бекап только базы данных}
-        {--with-files : Включить файлы в бекап}';
+        {--only-db : Create a backup of the database only}
+        {--with-files : Include files in the backup}';
 
-    protected $description = 'Создать бекап базы данных и файлов';
+    protected $description = 'Create a backup of the database and files';
 
     public function handle(): int
     {
-        $this->info('Начинаю создание бекапа...');
+        $this->info('Starting backup creation...');
 
         if ($this->option('with-files')) {
             config(['backup.include_files' => true]);
@@ -24,11 +24,11 @@ class BackupRun extends Command
         try {
             BackupDatabaseJob::dispatchSync();
             
-            $this->info('Бекап успешно создан');
+            $this->info('Backup successfully created');
 
             return Command::SUCCESS;
         } catch (\Exception $e) {
-            $this->error("Ошибка при создании бекапа: {$e->getMessage()}");
+            $this->error("Error while creating backup: {$e->getMessage()}");
 
             return Command::FAILURE;
         }

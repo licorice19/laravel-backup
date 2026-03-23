@@ -4,29 +4,48 @@ namespace Licorice19\Backup\Services;
 
 use Carbon\Carbon;
 use Ifsnop\Mysqldump\Mysqldump;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+use Licorice19\Backup\Exceptions\BackupException;
 use ZipArchive;
 
 class BackupService
 {
+    protected string $disk;
     protected string $backupPath;
     protected int $daysToKeep;
     protected int $maxBackups;
+    protected string $tempPath;
 
     public function __construct()
     {
-        $this->backupPath = storage_path('app/' . config('backup.path', 'backups'));
+        $this->disk = config('backup.disk', 'local');
+        $this->backupPath = config('backup.path', 'backups');
         $this->daysToKeep = config('backup.days_to_keep', 7);
         $this->maxBackups = config('backup.max_backups', 10);
+        $this->tempPath = storage_path('app/backup-temp');
 
-        if (!File::isDirectory($this->backupPath)) {
-            File::makeDirectory($this->backupPath, 0755, true);
+        if (!File::isDirectory($this->tempPath)) {
+            File::makeDirectory($this->tempPath, 0755, true);
+        }
+
+        if (!Storage::disk($this->disk)->exists($this->backupPath)) {
+            Storage::disk($this->disk)->makeDirectory($this->backupPath);
         }
     }
 
     /**
-     * Создать бекап базы данных
+     * Get a Storage Disc Instance
+     */
+    protected function storage(): \Illuminate\Contracts\Filesystem\Filesystem
+    {
+        return Storage::disk($this->disk);
+    }
+
+    /**
+     * Create a database backup
      */
     public function backupDatabase(): string
     {
@@ -36,79 +55,87 @@ class BackupService
 
         $timestamp = now()->format('Y-m-d_His');
         $filename = "backup_{$timestamp}.zip";
-        $zipPath = $this->backupPath . '/' . $filename;
+        $relativePath = $this->backupPath . '/' . $filename;
 
-        // Временный файл для дампа
-        $sqlFile = $this->backupPath . '/temp_database.sql';
+        $tempZipPath = $this->tempPath . '/' . $filename;
+        $sqlFile = $this->tempPath . '/temp_database.sql';
 
         try {
-            // Создаем ZIP-архив
             $zip = new ZipArchive();
-            if ($zip->open($zipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
-                throw new \Exception("Не удалось создать ZIP-архив: {$zipPath}");
+            if ($zip->open($tempZipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+                throw new \Exception("Failed to create ZIP archive: {$tempZipPath}");
             }
 
-            // Дамп базы данных в зависимости от драйвера
             if ($driver === 'sqlite') {
                 $this->dumpSqlite($zip, $dbConfig);
             } elseif (in_array($driver, ['mysql', 'mariadb'])) {
                 $this->dumpMysql($zip, $dbConfig, $sqlFile);
             } else {
-                throw new \Exception("Неподдерживаемый драйвер базы данных: {$driver}");
+                throw new \Exception("Unsupported database driver: {$driver}");
             }
 
-            // Добавляем файлы, если включено
             if (config('backup.include_files', false)) {
                 $this->addFilesToZip($zip);
             }
 
-            // Добавляем информацию о бекапе
             $manifest = $this->createManifest();
             $manifest['driver'] = $driver;
+            $manifest['disk'] = $this->disk;
             $zip->addFromString('manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 
             $zip->close();
 
-            // Удаляем временный файл
+            $sha256 = hash_file('sha256', $tempZipPath);
+            $manifest['sha256'] = $sha256;
+
+            $zip = new ZipArchive();
+            if ($zip->open($tempZipPath) !== true) {
+                throw new \Exception("Failed to open archive to add checksum");
+            }
+            $zip->addFromString('manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+            $zip->close();
+
+            $fileStream = fopen($tempZipPath, 'r');
+            $this->storage()->put($relativePath, $fileStream);
+            fclose($fileStream);
+
+            File::delete($tempZipPath);
             if (File::exists($sqlFile)) {
                 File::delete($sqlFile);
             }
 
-            Log::info("Бекап успешно создан: {$filename}");
+            Log::info("Backup successfully created: {$filename} on storage: {$this->disk}");
 
-            return $zipPath;
+            return $relativePath;
         } catch (\Exception $e) {
-            // Удаляем временные файлы при ошибке
             if (File::exists($sqlFile)) {
                 File::delete($sqlFile);
             }
-            if (File::exists($zipPath)) {
-                File::delete($zipPath);
+            if (File::exists($tempZipPath)) {
+                File::delete($tempZipPath);
             }
 
-            Log::error("Ошибка при создании бекапа: " . $e->getMessage());
+            Log::error("Error while creating backup: " . $e->getMessage());
             throw $e;
         }
     }
 
     /**
-     * Дамп SQLite базы данных
+     * SQLite database dump
      */
     protected function dumpSqlite(ZipArchive $zip, array $dbConfig): void
     {
         $dbPath = $dbConfig['database'];
 
         if (!File::exists($dbPath)) {
-            throw new \Exception("Файл базы данных SQLite не найден: {$dbPath}");
+            throw new \Exception("SQLite database file not found: {$dbPath}");
         }
 
-        // Копируем файл БД во временный файл (чтобы избежать блокировок)
-        $tempDbPath = $this->backupPath . '/temp_database.sqlite';
+        $tempDbPath = $this->tempPath . '/temp_database.sqlite';
         copy($dbPath, $tempDbPath);
 
         $zip->addFile($tempDbPath, 'database.sqlite');
 
-        // Удалим временный файл после завершения скрипта
         register_shutdown_function(function () use ($tempDbPath) {
             if (File::exists($tempDbPath)) {
                 @unlink($tempDbPath);
@@ -117,14 +144,13 @@ class BackupService
     }
 
     /**
-     * Дамп MySQL/MariaDB базы данных
+     * MySQL/MariaDB database dump
      */
     protected function dumpMysql(ZipArchive $zip, array $dbConfig, string $sqlFile): void
     {
         $username = $dbConfig['username'] ?? 'root';
         $password = $dbConfig['password'] ?? '';
 
-        // Дамп базы данных через mysqldump-php
         $dump = new Mysqldump(
             $this->buildDsn($dbConfig),
             $username,
@@ -137,25 +163,40 @@ class BackupService
     }
 
     /**
-     * Очистить старые бекапы
+     * Clean storage from old backups
      */
     public function cleanOldBackups(): int
     {
         $deletedCount = 0;
-        $files = collect(File::files($this->backupPath))
-            ->filter(fn($file) => str_ends_with($file->getFilename(), '.zip'))
-            ->sortByDesc('mtime');
+        $files = collect($this->storage()->files($this->backupPath))
+            ->filter(fn($file) => str_ends_with($file, '.zip'))
+            ->map(fn($file) => [
+                'path' => $file,
+                'timestamp' => $this->storage()->lastModified($file),
+            ])
+            ->sortByDesc('timestamp');
 
-        // Удаляем по количеству дней
-        $cutoffDate = now()->subDays($this->daysToKeep);
+        $cutoffTimestamp = now()->subDays($this->daysToKeep)->timestamp;
 
-        foreach ($files as $file) {
-            $fileDate = Carbon::createFromTimestamp($file->getMTime());
-
-            if ($fileDate->lt($cutoffDate) || $deletedCount >= $this->maxBackups) {
-                File::delete($file->getPathname());
+        foreach ($files as $index => $file) {
+            if ($file['timestamp'] < $cutoffTimestamp || $deletedCount >= $this->maxBackups) {
+                $this->storage()->delete($file['path']);
                 $deletedCount++;
-                Log::info("Удален старый бекап: {$file->getFilename()}");
+                Log::info("Deleted old backup: " . basename($file['path']));
+            }
+        }
+
+        $remainingFiles = collect($this->storage()->files($this->backupPath))
+            ->filter(fn($file) => str_ends_with($file, '.zip'))
+            ->sortByDesc(fn($file) => $this->storage()->lastModified($file))
+            ->values();
+
+        if ($remainingFiles->count() > $this->maxBackups) {
+            $toDelete = $remainingFiles->slice($this->maxBackups);
+            foreach ($toDelete as $file) {
+                $this->storage()->delete($file);
+                $deletedCount++;
+                Log::info("Old backup deleted (limit exceeded): " . basename($file));
             }
         }
 
@@ -163,16 +204,18 @@ class BackupService
     }
 
     /**
-     * Получить список бекапов
+     * Get list of backups
      */
     public function listBackups(): array
     {
-        $files = collect(File::files($this->backupPath))
-            ->filter(fn($file) => str_ends_with($file->getFilename(), '.zip'))
+        $files = collect($this->storage()->files($this->backupPath))
+            ->filter(fn($file) => str_ends_with($file, '.zip'))
             ->map(fn($file) => [
-                'name' => $file->getFilename(),
-                'size' => $this->formatBytes($file->getSize()),
-                'date' => Carbon::createFromTimestamp($file->getMTime())->format('d.m.Y H:i:s'),
+                'name' => basename($file),
+                'path' => $file,
+                'size' => $this->formatBytes($this->storage()->size($file)),
+                'date' => Carbon::createFromTimestamp($this->storage()->lastModified($file))->format('d.m.Y H:i:s'),
+                'disk' => $this->disk,
             ])
             ->sortByDesc('date')
             ->values()
@@ -182,19 +225,19 @@ class BackupService
     }
 
     /**
-     * Получить размер всех бекапов
+     * Get size of all backups
      */
     public function getTotalSize(): string
     {
-        $totalBytes = collect(File::files($this->backupPath))
-            ->filter(fn($file) => str_ends_with($file->getFilename(), '.zip'))
-            ->sum(fn($file) => $file->getSize());
+        $totalBytes = collect($this->storage()->files($this->backupPath))
+            ->filter(fn($file) => str_ends_with($file, '.zip'))
+            ->sum(fn($file) => $this->storage()->size($file));
 
         return $this->formatBytes((int) $totalBytes);
     }
 
     /**
-     * Построить DSN для подключения к БД
+     * Build a DSN to connect to the database
      */
     protected function buildDsn(array $config): string
     {
@@ -206,7 +249,7 @@ class BackupService
     }
 
     /**
-     * Настройки дампа
+     * Dump settings
      */
     protected function getDumpSettings(): array
     {
@@ -229,7 +272,7 @@ class BackupService
     }
 
     /**
-     * Добавить файлы в ZIP-архив
+     * Add files to zip archive
      */
     protected function addFilesToZip(ZipArchive $zip): void
     {
@@ -246,7 +289,7 @@ class BackupService
     }
 
     /**
-     * Рекурсивно добавить директорию в ZIP
+     * Recursively add a directory to a ZIP
      */
     protected function addDirectoryToZip(ZipArchive $zip, string $directory, array $exclude, string $zipPath = ''): void
     {
@@ -255,7 +298,6 @@ class BackupService
         foreach ($files as $file) {
             $relativePath = $zipPath . '/' . $file->getFilename();
 
-            // Проверяем исключения
             $shouldExclude = false;
             foreach ($exclude as $excluded) {
                 if (str_contains($file->getPathname(), $excluded)) {
@@ -269,7 +311,6 @@ class BackupService
             }
         }
 
-        // Рекурсивно обходим поддиректории
         $directories = File::directories($directory);
         foreach ($directories as $subDir) {
             $dirName = basename($subDir);
@@ -283,7 +324,7 @@ class BackupService
     }
 
     /**
-     * Создать манифест бекапа
+     * Create a backup manifest
      */
     protected function createManifest(): array
     {
@@ -297,140 +338,165 @@ class BackupService
     }
 
     /**
-     * Восстановить из бекапа
+     * Restore from backup
      */
-    public function restore(string $filename, bool $dbOnly = false): array
+    public function restore(string $filename, bool $dbOnly = false, bool $useTransactional = true): array
     {
-        $zipPath = $this->backupPath . '/' . $filename;
+        $relativePath = $this->backupPath . '/' . $filename;
 
-        if (!File::exists($zipPath)) {
-            throw new \Exception("Файл бекапа не найден: {$filename}");
+        if (!$this->storage()->exists($relativePath)) {
+            throw new BackupException("Backup file not found: {$filename}");
         }
 
-        $zip = new ZipArchive();
-        if ($zip->open($zipPath) !== true) {
-            throw new \Exception("Не удалось открыть архив: {$filename}");
+        $tempZipPath = $this->tempPath . '/' . $filename;
+        $fileStream = $this->storage()->readStream($relativePath);
+        file_put_contents($tempZipPath, stream_get_contents($fileStream));
+        if (is_resource($fileStream)) {
+            fclose($fileStream);
         }
-
-        // Читаем манифест
-        $manifestContent = $zip->getFromName('manifest.json');
-        if ($manifestContent === false) {
-            throw new \Exception("Архив не содержит manifest.json");
-        }
-
-        $manifest = json_decode($manifestContent, true);
-        $driver = $manifest['driver'] ?? 'sqlite';
-
-        $result = [
-            'success' => true,
-            'manifest' => $manifest,
-            'database_restored' => false,
-            'files_restored' => false,
-        ];
 
         try {
-            // Создаем бекап текущей БД перед восстановлением
-            $this->createPreRestoreBackup();
+            $this->verifyBackup($tempZipPath);
 
-            // Восстанавливаем БД
-            if ($driver === 'sqlite') {
-                $this->restoreSqlite($zip);
-            } elseif (in_array($driver, ['mysql', 'mariadb'])) {
-                $this->restoreMysql($zip);
+            $manifest = $this->readManifest($tempZipPath);
+            $this->verifyChecksum($tempZipPath, $manifest);
+
+            $driver = $manifest['driver'] ?? 'sqlite';
+
+            $zip = new ZipArchive();
+            if ($zip->open($tempZipPath) !== true) {
+                throw new BackupException("Failed to open archive: {$filename}");
             }
 
-            $result['database_restored'] = true;
+            $result = [
+                'success' => true,
+                'manifest' => $manifest,
+                'database_restored' => false,
+                'files_restored' => false,
+                'verification_passed' => true,
+            ];
 
-            // Восстанавливаем файлы
-            if (!$dbOnly && $zip->locateName('files/') !== false) {
-                $this->restoreFiles($zip);
-                $result['files_restored'] = true;
+            try {
+                $this->createPreRestoreBackup();
+
+                if ($driver === 'sqlite') {
+                    $this->restoreSqlite($zip);
+                } elseif (in_array($driver, ['mysql', 'mariadb'])) {
+                    if ($useTransactional && config('backup.transactional_restore', true)) {
+                        $sqlContent = $zip->getFromName('database.sql');
+                        if ($sqlContent === false) {
+                            throw new BackupException("The archive does not contain database.sql");
+                        }
+                        $this->restoreMysqlTransactional($tempZipPath, $sqlContent);
+                    } else {
+                        $this->restoreMysql($zip);
+                    }
+                }
+
+                $result['database_restored'] = true;
+
+                if (!$dbOnly && $zip->locateName('files/') !== false) {
+                    $this->restoreFiles($zip);
+                    $result['files_restored'] = true;
+                }
+
+                Log::info("Restoring from backup completed successfully: {$filename}");
+
+            } catch (\Throwable $e) {
+                $result['success'] = false;
+                $result['error'] = $e->getMessage();
+                Log::error("Restore Error: " . $e->getMessage());
+                throw $e;
+            } finally {
+                $zip->close();
             }
 
-            Log::info("Восстановление из бекапа завершено: {$filename}");
+            return $result;
 
-        } catch (\Exception $e) {
-            $result['success'] = false;
-            $result['error'] = $e->getMessage();
-            Log::error("Ошибка восстановления: " . $e->getMessage());
+        } catch (\Throwable $e) {
             throw $e;
         } finally {
-            $zip->close();
+            File::delete($tempZipPath);
         }
-
-        return $result;
     }
 
     /**
-     * Создать бекап перед восстановлением
+     * Create a backup before restoring
      */
     protected function createPreRestoreBackup(): string
     {
         $timestamp = now()->format('Y-m-d_His');
         $filename = "pre_restore_{$timestamp}.zip";
-        $zipPath = $this->backupPath . '/' . $filename;
+        $relativePath = $this->backupPath . '/' . $filename;
 
         $connection = config('database.default');
         $dbConfig = config("database.connections.{$connection}");
         $driver = $dbConfig['driver'] ?? 'mysql';
 
+        $tempZipPath = $this->tempPath . '/' . $filename;
+
         $zip = new ZipArchive();
-        $zip->open($zipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE);
+        $zip->open($tempZipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE);
 
         if ($driver === 'sqlite') {
             $dbPath = $dbConfig['database'];
             if (File::exists($dbPath)) {
-                $tempPath = $this->backupPath . '/temp_pre_restore.sqlite';
+                $tempPath = $this->tempPath . '/temp_pre_restore.sqlite';
                 copy($dbPath, $tempPath);
                 $zip->addFile($tempPath, 'database.sqlite');
+                $zip->close();
+                File::delete($tempPath);
+            } else {
+                $zip->close();
             }
+        } else {
+            $zip->close();
         }
 
-        $zip->close();
-
-        // Удаляем временный файл
-        if (isset($tempPath) && File::exists($tempPath)) {
-            File::delete($tempPath);
+        if (File::exists($tempZipPath) && File::size($tempZipPath) > 0) {
+            $fileStream = fopen($tempZipPath, 'r');
+            $this->storage()->put($relativePath, $fileStream);
+            fclose($fileStream);
         }
 
-        Log::info("Создан бекап перед восстановлением: {$filename}");
+        File::delete($tempZipPath);
 
-        return $zipPath;
+        Log::info("A backup was created before restoration.: {$filename}");
+
+        return $relativePath;
     }
 
     /**
-     * Восстановить SQLite базу данных
+     * Restore SQLite database
      */
     protected function restoreSqlite(ZipArchive $zip): void
     {
         $dbPath = config('database.connections.sqlite.database');
 
         if (empty($dbPath)) {
-            throw new \Exception("Путь к SQLite базе данных не настроен");
+            throw new \Exception("Filepath to SQLite file is not set.");
         }
 
-        // Извлекаем файл БД
-        $tempDbPath = $this->backupPath . '/temp_restore.sqlite';
+        $tempDbPath = $this->tempPath . '/temp_restore.sqlite';
         $content = $zip->getFromName('database.sqlite');
 
         if ($content === false) {
-            throw new \Exception("Архив не содержит database.sqlite");
+            throw new \Exception("Archive doesn't contatin database.sqlite");
         }
 
         File::put($tempDbPath, $content);
 
-        // Заменяем текущую БД
         if (File::exists($dbPath)) {
             File::delete($dbPath);
         }
 
         File::move($tempDbPath, $dbPath);
 
-        Log::info("SQLite база данных восстановлена");
+        Log::info("SQLite database restored");
     }
 
     /**
-     * Восстановить MySQL базу данных
+     * Restore MySQL database
      */
     protected function restoreMysql(ZipArchive $zip): void
     {
@@ -440,32 +506,26 @@ class BackupService
             throw new \Exception("Архив не содержит database.sql");
         }
 
-        // Сохраняем во временный файл
-        $tempSqlPath = $this->backupPath . '/temp_restore.sql';
+        $tempSqlPath = $this->tempPath . '/temp_restore.sql';
         File::put($tempSqlPath, $sqlContent);
 
         try {
             $connection = config('database.default');
             $dbConfig = config("database.connections.{$connection}");
 
-            // Подключаемся к БД
             $dsn = $this->buildDsn($dbConfig);
             $pdo = new \PDO($dsn, $dbConfig['username'] ?? 'root', $dbConfig['password'] ?? '');
 
-            // Отключаем проверки внешних ключей
             $pdo->exec('SET FOREIGN_KEY_CHECKS = 0');
             $pdo->exec('SET SQL_MODE = ""');
 
-            // Выполняем SQL
-            $pdo->exec($sqlContent);
+            $this->executeSqlStatements($pdo, $sqlContent);
 
-            // Включаем проверки обратно
             $pdo->exec('SET FOREIGN_KEY_CHECKS = 1');
 
-            Log::info("MySQL база данных восстановлена");
+            Log::info("MySQL database restored");
 
         } finally {
-            // Удаляем временный файл
             if (File::exists($tempSqlPath)) {
                 File::delete($tempSqlPath);
             }
@@ -473,67 +533,118 @@ class BackupService
     }
 
     /**
-     * Восстановить файлы
+     * Execute SQL statements from a dump
+     */
+    protected function executeSqlStatements(\PDO $pdo, string $sqlContent): void
+    {
+        $sql = preg_replace('/--.*$/m', '', $sqlContent);
+        $sql = preg_replace('/\/\*.*?\*\//s', '', $sql);
+
+        $statements = [];
+        $current = '';
+        $inString = false;
+        $stringChar = '';
+        $len = strlen($sql);
+
+        for ($i = 0; $i < $len; $i++) {
+            $char = $sql[$i];
+
+            if (!$inString && ($char === "'" || $char === '"')) {
+                $inString = true;
+                $stringChar = $char;
+            } elseif ($inString && $char === $stringChar) {
+                $prevChar = ($i > 0) ? $sql[$i - 1] : '';
+                if ($prevChar !== '\\') {
+                    $inString = false;
+                }
+            }
+
+            if (!$inString && $char === ';') {
+                $stmt = trim($current);
+                if (!empty($stmt)) {
+                    $statements[] = $stmt;
+                }
+                $current = '';
+            } else {
+                $current .= $char;
+            }
+        }
+
+        $stmt = trim($current);
+        if (!empty($stmt)) {
+            $statements[] = $stmt;
+        }
+
+        foreach ($statements as $statement) {
+            if (!empty($statement)) {
+                $pdo->exec($statement);
+            }
+        }
+    }
+
+    /**
+     * Recover files
      */
     protected function restoreFiles(ZipArchive $zip): void
     {
-        $destinationBase = storage_path('app/public');
-        $tempDir = $this->backupPath . '/temp_files';
+        $destinationBase = realpath(storage_path('app/public'));
 
-        // Создаем временную директорию
-        if (!File::isDirectory($tempDir)) {
-            File::makeDirectory($tempDir, 0755, true);
-        }
-
-        // Извлекаем файлы
         for ($i = 0; $i < $zip->numFiles; $i++) {
             $filename = $zip->getNameIndex($i);
 
             if (str_starts_with($filename, 'files/')) {
-                $relativePath = substr($filename, 6); // Убираем 'files/'
+                $relativePath = substr($filename, 6);
+
+                $normalizedPath = str_replace(['../', '..\\', '/..', '\\..'], '', $relativePath);
+                $fullPath = $destinationBase . '/' . $normalizedPath;
+                $realFullPath = realpath(dirname($fullPath));
+
+                if ($realFullPath === false || !str_starts_with($realFullPath, $destinationBase)) {
+                    Log::warning("Skipped file with incorrect path: {$filename}");
+                    continue;
+                }
 
                 if (str_ends_with($filename, '/')) {
-                    // Это директория
-                    $dirPath = $destinationBase . '/' . $relativePath;
-                    if (!File::isDirectory($dirPath)) {
-                        File::makeDirectory($dirPath, 0755, true);
+                    if (!File::isDirectory($fullPath)) {
+                        File::makeDirectory($fullPath, 0755, true);
                     }
                 } else {
-                    // Это файл
                     $content = $zip->getFromIndex($i);
-                    $filePath = $destinationBase . '/' . $relativePath;
-                    $dirPath = dirname($filePath);
+                    $dirPath = dirname($fullPath);
 
                     if (!File::isDirectory($dirPath)) {
                         File::makeDirectory($dirPath, 0755, true);
                     }
 
-                    File::put($filePath, $content);
+                    File::put($fullPath, $content);
                 }
             }
         }
 
-        // Удаляем временную директорию
-        if (File::isDirectory($tempDir)) {
-            File::deleteDirectory($tempDir);
-        }
-
-        Log::info("Файлы восстановлены");
+        Log::info("Files are recovered successfuly");
     }
 
     /**
-     * Получить информацию о бекапе
+     * Get backup info
      */
     public function getBackupInfo(string $filename): ?array
     {
-        $zipPath = $this->backupPath . '/' . $filename;
+        $relativePath = $this->backupPath . '/' . $filename;
 
-        if (!File::exists($zipPath)) {
+        if (!$this->storage()->exists($relativePath)) {
             return null;
         }
 
+        $tempZipPath = $this->tempPath . '/' . $filename;
+        $fileStream = $this->storage()->readStream($relativePath);
+        file_put_contents($tempZipPath, stream_get_contents($fileStream));
+        if (is_resource($fileStream)) {
+            fclose($fileStream);
+        }
+
         $zip = new ZipArchive();
-        if ($zip->open($zipPath) !== true) {
+        if ($zip->open($tempZipPath) !== true) {
+            File::delete($tempZipPath);
             return null;
         }
 
@@ -542,14 +653,14 @@ class BackupService
 
         $info = [
             'filename' => $filename,
-            'size' => $this->formatBytes(File::size($zipPath)),
+            'size' => $this->formatBytes($this->storage()->size($relativePath)),
             'has_database' => $zip->locateName('database.sql') !== false || $zip->locateName('database.sqlite') !== false,
             'has_files' => $zip->locateName('files/') !== false,
             'file_count' => 0,
             'manifest' => $manifest,
+            'disk' => $this->disk,
         ];
 
-        // Считаем файлы
         for ($i = 0; $i < $zip->numFiles; $i++) {
             $name = $zip->getNameIndex($i);
             if (!str_ends_with($name, '/') && !in_array($name, ['manifest.json', 'database.sql', 'database.sqlite'])) {
@@ -558,16 +669,225 @@ class BackupService
         }
 
         $zip->close();
+        File::delete($tempZipPath);
 
         return $info;
     }
 
     /**
-     * Форматировать размер файла
+     * Get full path to backup file (for a local storage only)
+     */
+    public function getBackupFullPath(string $filename): ?string
+    {
+        $relativePath = $this->backupPath . '/' . $filename;
+
+        if (!$this->storage()->exists($relativePath)) {
+            return null;
+        }
+        if (in_array($this->disk, ['local', 'public'])) {
+            return Storage::disk($this->disk)->path($relativePath);
+        }
+
+        return null;
+    }
+
+    /**
+     * Download backup (Return file сontent)
+     */
+    public function downloadBackup(string $filename): ?string
+    {
+        $relativePath = $this->backupPath . '/' . $filename;
+
+        if (!$this->storage()->exists($relativePath)) {
+            return null;
+        }
+
+        return $this->storage()->get($relativePath);
+    }
+
+    /**
+     * Verifying a ZIP archive before recovery
+     */
+    public function verifyBackup(string $zipPath): void
+    {
+        if (!file_exists($zipPath)) {
+            throw new BackupException("File not found: {$zipPath}");
+        }
+
+        $zip = new ZipArchive();
+        $result = $zip->open($zipPath, ZipArchive::CHECKCONS);
+
+        if ($result !== true) {
+            $errors = [
+                ZipArchive::ER_NOZIP => 'It is not a zip archive.',
+                ZipArchive::ER_INCONS => 'Archive is damaged (incorrect structure)',
+                ZipArchive::ER_CRC => 'CRC checksum error',
+                ZipArchive::ER_READ => 'File read error',
+            ];
+            throw new BackupException($errors[$result] ?? "Error zip: {$result}");
+        }
+
+        $hasDatabase = $zip->locateName('database.sql') !== false 
+            || $zip->locateName('database.sqlite') !== false;
+        
+        if (!$hasDatabase) {
+            $zip->close();
+            throw new BackupException('Archive doesn\'t contain a database file');
+        }
+
+        $zip->close();
+    }
+
+    /**
+     * Verifying the archive checksum
+     */
+    public function verifyChecksum(string $zipPath, array $manifest): void
+    {
+        $actual = hash_file('sha256', $zipPath);
+        $expected = $manifest['sha256'] ?? null;
+
+        if ($expected === null) {
+            Log::warning("Backup {$zipPath} does not contain sha256 in the manifest");
+            return;
+        }
+
+        if (!hash_equals($expected, $actual)) {
+            throw new BackupException(
+                "The checksum does not match.\nExpected: {$expected}\nActual:  {$actual}"
+            );
+        }
+    }
+
+    /**
+     * Read manifest from file
+     */
+    public function readManifest(string $zipPath): array
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($zipPath) !== true) {
+            throw new BackupException("Failed to open archive: {$zipPath}");
+        }
+
+        $manifestContent = $zip->getFromName('manifest.json');
+        $zip->close();
+
+        if ($manifestContent === false) {
+            throw new BackupException("Archive doesn't contain manifest.json");
+        }
+
+        return json_decode($manifestContent, true) ?? [];
+    }
+
+    /**
+     * Get list of current tables (excluding rollback temporary tables)
+     */
+    public function getCurrentTables(\PDO $pdo): array
+    {
+        $stmt = $pdo->query("SHOW TABLES");
+        $all = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+
+        return array_values(array_filter($all, fn($t) => !str_starts_with($t, '_restore_backup_')));
+    }
+
+    /**
+     * Check for "hanging" tables from an incomplete restore
+     */
+    public function checkStaleRestoreTables(): array
+    {
+        $connection = config('database.default');
+        $driver = config("database.connections.{$connection}.driver");
+
+        if (!in_array($driver, ['mysql', 'mariadb'])) {
+            return [];
+        }
+
+        try {
+            $pdo = DB::getPdo();
+            $all = $pdo->query("SHOW TABLES")->fetchAll(\PDO::FETCH_COLUMN);
+            return array_values(array_filter($all, fn($t) => str_starts_with($t, '_restore_backup_')));
+        } catch (\Throwable $e) {
+            Log::warning("Failed to check stale-tables: {$e->getMessage()}");
+            return [];
+        }
+    }
+
+    /**
+     * Rollback 'restore'
+     */
+    protected function rollbackRestore(\PDO $pdo, array $renamedTables): void
+    {
+        $current = $this->getCurrentTables($pdo);
+        foreach ($current as $table) {
+            if (!str_starts_with($table, '_restore_backup_')) {
+                try {
+                    $quotedTable = str_replace('`', '``', $table);
+                    $pdo->exec("DROP TABLE IF EXISTS `{$quotedTable}`");
+                } catch (\Throwable) {
+                }
+            }
+        }
+
+        foreach ($renamedTables as $table) {
+            try {
+                $quotedTable = str_replace('`', '``', $table);
+                $pdo->exec("RENAME TABLE `_restore_backup_{$quotedTable}` TO `{$quotedTable}`");
+            } catch (\Throwable $e) {
+                Log::critical("Failed to rollback {$table} ", [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+    }
+
+    /**
+     * Transactional Restore for MySQL
+     */
+    protected function restoreMysqlTransactional(string $zipPath, string $sqlContent): void
+    {
+        $connection = config('database.default');
+        $dbConfig = config("database.connections.{$connection}");
+
+        $dsn = $this->buildDsn($dbConfig);
+        $pdo = new \PDO($dsn, $dbConfig['username'] ?? 'root', $dbConfig['password'] ?? '');
+        $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+
+        $tables = $this->getCurrentTables($pdo);
+        $renamed = [];
+
+        try {
+            foreach ($tables as $table) {
+                $quotedTable = str_replace('`', '``', $table);
+                $tmp = "_restore_backup_{$quotedTable}";
+                $pdo->exec("RENAME TABLE `{$quotedTable}` TO `{$tmp}`");
+                $renamed[] = $table;
+            }
+
+            $pdo->exec('SET FOREIGN_KEY_CHECKS = 0');
+            $pdo->exec('SET SQL_MODE = ""');
+
+            $this->executeSqlStatements($pdo, $sqlContent);
+
+            $pdo->exec('SET FOREIGN_KEY_CHECKS = 1');
+
+            foreach ($renamed as $table) {
+                $quotedTable = str_replace('`', '``', $table);
+                $pdo->exec("DROP TABLE IF EXISTS `_restore_backup_{$quotedTable}`");
+            }
+
+            Log::info("MySQL database restored (transactionally)");
+
+        } catch (\Throwable $e) {
+            $this->rollbackRestore($pdo, $renamed);
+            throw new BackupException("Failed to restore, files are recovered: {$e->getMessage()}", 0, $e);
+        }
+    }
+
+    /**
+     * Format size
      */
     protected function formatBytes(int $bytes, int $precision = 2): string
     {
-        $units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
 
         for ($i = 0; $bytes > 1024 && $i < count($units) - 1; $i++) {
             $bytes /= 1024;

@@ -4,10 +4,14 @@ namespace Licorice19\Backup;
 
 use Illuminate\Support\ServiceProvider;
 use Licorice19\Backup\Services\BackupService;
+use Licorice19\Backup\Services\LargeBackupService;
 use Licorice19\Backup\Console\Commands\BackupRun;
 use Licorice19\Backup\Console\Commands\BackupList;
 use Licorice19\Backup\Console\Commands\BackupRestore;
 use Licorice19\Backup\Console\Commands\BackupClean;
+use Licorice19\Backup\Console\Commands\BackupCleanupStale;
+use Licorice19\Backup\Console\Commands\BackupLarge;
+
 
 class BackupServiceProvider extends ServiceProvider
 {
@@ -20,13 +24,19 @@ class BackupServiceProvider extends ServiceProvider
             return new BackupService();
         });
 
+        $this->app->singleton(LargeBackupService::class, function () {
+            return new LargeBackupService();
+        });
+
         $this->app->alias(BackupService::class, 'backup');
+        $this->app->alias(LargeBackupService::class, 'backup.large');
 
         $this->mergeConfigFrom(
             __DIR__ . '/config/backup.php',
             'backup'
         );
     }
+
 
     /**
      * Bootstrap any application services.
@@ -43,7 +53,10 @@ class BackupServiceProvider extends ServiceProvider
                 BackupList::class,
                 BackupRestore::class,
                 BackupClean::class,
+                BackupCleanupStale::class,
+                BackupLarge::class,
             ]);
         }
+
     }
 }
