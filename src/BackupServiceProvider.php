@@ -62,5 +62,7 @@ class BackupServiceProvider extends ServiceProvider
             ]);
         }
 
+        $this->loadMigrationsFrom(__DIR__ . '/database/migrations');
+
     }
 }
