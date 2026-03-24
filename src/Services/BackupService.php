@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Licorice19\Backup\Exceptions\BackupException;
+use Licorice19\Backup\Models\BackupMetadata;
 use ZipArchive;
 
 class BackupService
@@ -74,40 +75,33 @@ class BackupService
                 throw new \Exception("Unsupported database driver: {$driver}");
             }
 
-            if (config('backup.include_files', false)) {
+            $hasFiles = config('backup.include_files', false);
+            if ($hasFiles) {
                 $this->addFilesToZip($zip);
             }
 
             $manifest = $this->createManifest();
             $manifest['driver'] = $driver;
             $manifest['disk'] = $this->disk;
-            $manifest['sha256'] = 'CALCULATING';
             $zip->addFromString('manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 
             $zip->close();
 
+            // Calculate SHA256 after all files are added to archive
             $sha256 = hash_file('sha256', $tempZipPath);
-            
-            $manifest['sha256'] = $sha256;
+            $fileSize = filesize($tempZipPath);
 
-            $zip = new ZipArchive();
-            if ($zip->open($tempZipPath) !== true) {
-                throw new \Exception("Failed to open archive to add checksum");
-            }
-            $zip->addFromString('manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-            $zip->close();
-
-            // Calculate final SHA256 (with real checksum in manifest)
-            $finalSha256 = hash_file('sha256', $tempZipPath);
-            $manifest['sha256'] = $finalSha256;
-
-            // Update manifest one final time with the checksum that will match
-            $zip = new ZipArchive();
-            if ($zip->open($tempZipPath) !== true) {
-                throw new \Exception("Failed to open archive to add final checksum");
-            }
-            $zip->addFromString('manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-            $zip->close();
+            // Save metadata to database
+            BackupMetadata::create([
+                'filename' => $filename,
+                'sha256' => $sha256,
+                'size' => $fileSize,
+                'driver' => $driver,
+                'has_database' => true,
+                'has_files' => $hasFiles,
+                'manifest' => $manifest,
+                'created_at' => now(),
+            ]);
 
             $fileStream = fopen($tempZipPath, 'r');
             $this->storage()->put($relativePath, $fileStream);
@@ -194,7 +188,9 @@ class BackupService
 
         foreach ($files as $index => $file) {
             if ($file['timestamp'] < $cutoffTimestamp || $deletedCount >= $this->maxBackups) {
+                $filename = basename($file['path']);
                 $this->storage()->delete($file['path']);
+                BackupMetadata::deleteByFilename($filename);
                 $deletedCount++;
                 Log::info("Deleted old backup: " . basename($file['path']));
             }
@@ -208,7 +204,9 @@ class BackupService
         if ($remainingFiles->count() > $this->maxBackups) {
             $toDelete = $remainingFiles->slice($this->maxBackups);
             foreach ($toDelete as $file) {
+                $filename = basename($file);
                 $this->storage()->delete($file);
+                BackupMetadata::deleteByFilename($filename);
                 $deletedCount++;
                 Log::info("Old backup deleted (limit exceeded): " . basename($file));
             }
@@ -373,7 +371,9 @@ class BackupService
             $this->verifyBackup($tempZipPath);
 
             $manifest = $this->readManifest($tempZipPath);
-            $this->verifyChecksum($tempZipPath, $manifest);
+            
+            // Verify checksum using database metadata
+            $this->verifyChecksumFromDatabase($tempZipPath, $filename);
 
             $driver = $manifest['driver'] ?? 'sqlite';
 
@@ -753,17 +753,42 @@ class BackupService
     }
 
     /**
-     * Verifying the archive checksum
+     * Verifying the archive checksum using database metadata
+     */
+    public function verifyChecksumFromDatabase(string $zipPath, string $filename): void
+    {
+        $actual = hash_file('sha256', $zipPath);
+        
+        // Get expected checksum from database
+        $metadata = BackupMetadata::getByFilename($filename);
+        
+        if ($metadata === null) {
+            Log::warning("Backup metadata not found for {$filename}, skipping checksum verification");
+            return;
+        }
+
+        $expected = $metadata->sha256;
+
+        if (!hash_equals($expected, $actual)) {
+            throw new BackupException(
+                "The checksum does not match.\nExpected: {$expected}\nActual:  {$actual}"
+            );
+        }
+    }
+
+    /**
+     * Legacy checksum verification (from manifest - deprecated)
      */
     public function verifyChecksum(string $zipPath, array $manifest): void
     {
-        $actual = hash_file('sha256', $zipPath);
+        // For backwards compatibility with old backups that have sha256 in manifest
         $expected = $manifest['sha256'] ?? null;
 
         if ($expected === null) {
-            Log::warning("Backup {$zipPath} does not contain sha256 in the manifest");
             return;
         }
+
+        $actual = hash_file('sha256', $zipPath);
 
         if (!hash_equals($expected, $actual)) {
             throw new BackupException(
