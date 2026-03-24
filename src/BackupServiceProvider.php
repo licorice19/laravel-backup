@@ -47,6 +47,10 @@ class BackupServiceProvider extends ServiceProvider
             __DIR__ . '/config/backup.php' => config_path('backup.php'),
         ], 'backup-config');
 
+        $this->publishes([
+            __DIR__. '/database/migrations/'  => database_path('migrations'),
+        ], 'backup-migrations');        
+
         if ($this->app->runningInConsole()) {
             $this->commands([
                 BackupRun::class,
