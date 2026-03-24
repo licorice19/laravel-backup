@@ -81,16 +81,30 @@ class BackupService
             $manifest = $this->createManifest();
             $manifest['driver'] = $driver;
             $manifest['disk'] = $this->disk;
+            $manifest['sha256'] = 'CALCULATING';
             $zip->addFromString('manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 
             $zip->close();
 
             $sha256 = hash_file('sha256', $tempZipPath);
+            
             $manifest['sha256'] = $sha256;
 
             $zip = new ZipArchive();
             if ($zip->open($tempZipPath) !== true) {
                 throw new \Exception("Failed to open archive to add checksum");
+            }
+            $zip->addFromString('manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+            $zip->close();
+
+            // Calculate final SHA256 (with real checksum in manifest)
+            $finalSha256 = hash_file('sha256', $tempZipPath);
+            $manifest['sha256'] = $finalSha256;
+
+            // Update manifest one final time with the checksum that will match
+            $zip = new ZipArchive();
+            if ($zip->open($tempZipPath) !== true) {
+                throw new \Exception("Failed to open archive to add final checksum");
             }
             $zip->addFromString('manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
             $zip->close();
